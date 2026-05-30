@@ -1,86 +1,43 @@
-# chaos-rs
+# chaos_disk
 
-A deterministic, high-performance block-layer simulation engine built in Rust for fault-injection testing. `chaos-rs` provides an isolated, dual-layer virtual storage drive specifically architected to validate the atomic crash-safety invariants of write-ahead logs (WAL), transactional storage engines, and filesystems.
+A deterministic, hardware-level chaos engineering framework and storage device simulator built in Rust.
 
-By implementing strict Direct I/O emulation, memory page-alignment verification, and an independent administrative control harness, `chaos-rs` allows test suites to simulate physical hardware anomalies—such as ungraceful power loss, torn writes, and hardware unresponsiveness—with absolute determinism.
+`chaos_disk` provides a page-aligned virtual disk sandbox designed to intercept low-level I/O operations and inject structural media failures—such as torn writes, lost writes, bit-rot, and sector corruption—at precise operational boundaries. It allows infrastructure engineers to build automated, reliable crash-consistency tests for databases, filesystems, and write-ahead logs without flaky or non-reproducible test runs.
 
 ---
 
-## Architecture Overview
+## Architecture
 
-`chaos-rs` decouples the storage runtime into two distinct conceptual surfaces:
+The simulator maintains a dual-layer memory architecture in user space to mirror bare-metal storage controllers:
 
-1. **The Operational Face (`BlockDevice`):** The standard hardware abstraction layer exposed to your database engine. It enforces uniform, 4096-byte block boundaries and Direct I/O memory constraints.
-2. **The Administrative Face (`AdminControls`):** A segregated control interface used exclusively by testing harnesses to orchestrate macro-level physical faults (e.g., pulling the power cable, triggering cold reboots).
-
-```
-   PRODUCTION ENGINE                     CHAOS TESTING HARNESS
-         │                                         │
-         ▼ (BlockDevice Trait)                     ▼ (AdminControls Trait)
- ┌─────────────────────────────────────────────────────────────────┐
- │                           CHAOSDISK                             │
- │                                                                 │
- │   ┌───────────────────────┐             ┌───────────────────┐   │
- │   │ Volatile Cache (RAM)  │ ──[Flush]──>│  Stable Storage   │   │
- │   └───────────────────────┘             └───────────────────┘   │
- │               │                                   ▲             │
- │               └─────────── [Simulated Crash] ─────┘             │
- │                                (Vaporizes)                      │
- └─────────────────────────────────────────────────────────────────┘
-
-```
-
-### Core Components
-
-* **Dual-Layer Memory Geometry:** Maintains an active volatile write buffer (simulated drive controller RAM) alongside an underlying non-volatile persistence array (simulated disk platter).
-* **Direct I/O Guardrails:** Validates memory buffer address pointers using modulo arithmetic. Slices passed to the device must be strictly page-aligned (multiples of 4096 bytes) to match Direct Memory Access (DMA) physical constraints.
-* **Dirty Page Ledger:** Seamlessly tracks unsynchronized sectors to precisely simulate the volatility of hardware write-caches prior to an explicit synchronization barrier (`flush`).
+* **Volatile Cache (`volatile_cache`):** Simulates onboarding drive RAM/write buffers. Ephemeral data stays here and is lost instantly during an ungraceful shutdown.
+* **Stable Storage (`stable_storage`):** Simulates persistent, non-volatile media cells (NAND Flash or Magnetic Platter). Data here survives power severance.
+* **Dirty Page Ledger (`ledger`):** A tracking bitset identifying modified cache blocks that have not yet been synchronized via a barrier call.
 
 ---
 
 ## Features
 
-* **Deterministic Fault Injection:** Drive behavior is entirely reproducible, allowing edge-case storage bugs to be isolated and debugged reliably within standard CI/CD pipelines.
-* **Torn Write Simulation:** Injects mid-block truncation and sector corruption during ungraceful synchronization loops to verify checksum and torn-write protection mechanisms.
-* **Zero Overhead Baseline:** Built with optimized, low-level memory copies and dynamic vectors, ensuring minimal test-runtime inflation.
+* **Strict Page Alignment:** Enforces 4096-byte boundary verification on raw buffers to accurately mimic Direct I/O (`O_DIRECT`) and DMA constraints.
+* **Deterministic Scheduling:** Faults trip exactly on targeted write counts, flush counts, or specific block indices, eliminating random flakiness in CI/CD pipelines.
+* **Administrative Lifecycle Control:** Exposes manual hooks to `.crash()`, `.reboot()`, and `.resize()` the underlying partition media outside of the production application runtime.
+* **Automated Orchestration Harness:** Provides a generic `run_crash_test` framework that wraps workload execution, hardware power-severance, reboot recovery, and post-mortem state verification into a single atomic test cycle.
 
 ---
 
-## API Specification
-
-### The Operational Face
+## Core Abstractions
 
 ```rust
 pub trait BlockDevice {
-    /// Fetches a 4096-byte sector from the active volatile workspace.
     fn read_block(&mut self, block_id: u64, buffer: &mut [u8]) -> Result<(), BlockDeviceError>;
-
-    /// Stages a 4096-byte chunk into the controller write cache.
     fn write_block(&mut self, block_id: u64, data: &[u8]) -> Result<(), BlockDeviceError>;
-
-    /// The Synchronization Barrier (fsync/fdatasync).
-    /// Commits dirty sectors from volatile cache to stable storage.
     fn flush(&mut self) -> Result<(), BlockDeviceError>;
 }
 
-```
-
-### The Administrative Face
-
-```rust
 pub trait AdminControls {
-    /// Instantly vaporizes the volatile cache, clears the ledger,
-    /// and places the device into an unresponsive state.
     fn crash(&mut self) -> Result<(), BlockDeviceError>;
-
-    /// Restores power to the device controller, re-initializing 
-    /// state strictly from data that survived stable storage.
     fn reboot(&mut self) -> Result<(), BlockDeviceError>;
-
-    /// Diagnostic check evaluating device power state.
     fn is_frozen(&self) -> Result<bool, BlockDeviceError>;
-
-    /// Resizes the underlying storage arrays dynamically.
     fn resize(&mut self, new_size: u64) -> Result<(), BlockDeviceError>;
 }
 
@@ -88,19 +45,62 @@ pub trait AdminControls {
 
 ---
 
-## Error Model
+## Usage Example
 
-`chaos-rs` provides an explicit, hardware-centric error model (`BlockDeviceError`) to mirror physical disk-controller logic rather than high-level OS software errors:
+The following integration snippet sets up a deterministic power loss mid-operation during a storage sync routine:
 
-| Error Variant | Root Cause |
-| --- | --- |
-| `AlignmentMismatch` | The memory buffer address in RAM is not aligned to a 4096-byte boundary, violating DMA rules. |
-| `DiskspaceExceeded` | The requested logical block ID falls outside the physically provisioned sector capacity. |
-| `FrozenDevice` | An I/O request was executed against an unpowered or dead drive controller following a crash. |
-| `InterruptedOperation` | A write or flush sequence was truncated midway through execution by a crash event. |
+```rust
+use chaos_disk::{AlignedBlock, BlockDevice, BlockDeviceError, FaultPolicy, FaultTrigger, TriggerCondition, run_crash_test};
+
+#[test]
+fn test_deterministic_torn_write() {
+    let mut payload = AlignedBlock::new();
+    payload.data.fill(0xFF);
+
+    let (workload_result, crash_result) = run_crash_test(
+        10,
+        |disk| {
+            // 1. Stage full payload cleanly into volatile controller memory
+            disk.write_block(2, &payload)?;
+
+            // 2. Schedule a power cut precisely halfway through the first flush iteration
+            disk.set_fault(FaultTrigger {
+                condition: TriggerCondition::OnOperationCount(1),
+                policy: FaultPolicy::TornWrite { bytes_written: 2048 },
+            });
+
+            // 3. This barrier call will truncate data transfer and return InterruptedOperation
+            disk.flush()?;
+            Ok(())
+        },
+        |disk| {
+            // 4. Post-Reboot Verification Phase
+            let mut read_buffer = AlignedBlock::new();
+            disk.read_block(2, &mut read_buffer).unwrap();
+
+            // First 2KB successfully hit persistent platter cells before power cut
+            assert_eq!(read_buffer.data[0], 0xFF);
+            assert_eq!(read_buffer.data[2047], 0xFF);
+
+            // Remaining 2KB never committed and stayed zeroed
+            assert_eq!(read_buffer.data[2048], 0);
+            assert_eq!(read_buffer.data[4095], 0);
+        },
+    );
+
+    assert!(matches!(workload_result, Err(BlockDeviceError::InterruptedOperation)));
+    assert!(crash_result.is_ok());
+}
+
+```
 
 ---
 
-## License
+## Testing
 
-This project is licensed under the MIT License - see the LICENSE file for details.# chaos-rs
+Run the integration and verification test suite using cargo:
+
+```bash
+cargo test
+
+```

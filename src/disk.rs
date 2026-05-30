@@ -33,11 +33,24 @@ impl DerefMut for AlignedBlock {
 /// Defines when a scheduled fault should "trip" and execute its policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TriggerCondition {
-    /// Trigger the fault when `write_count` or `flush_count` hits this exact number.
-    OnOperationCount(u64),
+    /// Trigger the fault when `write_count` hits this exact number.
+    OnWriteCount(u64),
+
+    /// Trigger the fault when `flush_count` hits this exact number.
+    /// Note: This will trigger for EVERY dirty block during that specific flush call.
+    OnFlushCount(u64),
 
     /// Trigger the fault whenever a specific `block_id` is targeted.
     OnBlockId(u64),
+
+    /// Trigger the fault for a specific block during a specific flush cycle.
+    OnFlushBlock { flush_count: u64, block_id: u64 },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OpContext {
+    Write,
+    Flush,
 }
 
 /// The specific type of hardware failure to simulate.
@@ -146,26 +159,30 @@ impl ChaosDisk {
     /// Internal engine that checks if the current op count or block ID matches the armed fault.
     fn should_trigger_fault(
         &self,
-        current_count: u64,
+        context: OpContext,
+        current_op_count: u64,
         current_block_id: u64,
     ) -> Option<FaultPolicy> {
         let trigger = self.scheduled_fault?;
-        match trigger.condition {
-            TriggerCondition::OnOperationCount(target_count) => {
-                if current_count == target_count {
-                    Some(trigger.policy)
-                } else {
-                    None
-                }
+        let is_match = match trigger.condition {
+            TriggerCondition::OnWriteCount(target) => {
+                matches!(context, OpContext::Write) && target == current_op_count
             }
-            TriggerCondition::OnBlockId(target_block_id) => {
-                if current_block_id == target_block_id {
-                    Some(trigger.policy)
-                } else {
-                    None
-                }
+            TriggerCondition::OnFlushCount(target) => {
+                matches!(context, OpContext::Flush) && target == current_op_count
             }
-        }
+            TriggerCondition::OnBlockId(target) => target == current_block_id,
+            TriggerCondition::OnFlushBlock {
+                flush_count,
+                block_id,
+            } => {
+                matches!(context, OpContext::Flush)
+                    && flush_count == current_op_count
+                    && block_id == current_block_id
+            }
+        };
+
+        if is_match { Some(trigger.policy) } else { None }
     }
 }
 
@@ -206,7 +223,9 @@ impl BlockDevice for ChaosDisk {
 
         let (start, end) = self.calculate_offset(block_id);
 
-        if let Some(policy) = self.should_trigger_fault(self.write_count, block_id) {
+        if let Some(policy) =
+            self.should_trigger_fault(OpContext::Write, self.write_count, block_id)
+        {
             match policy {
                 FaultPolicy::None => {
                     // Normal operation even if a trigger matched (None policy)
@@ -264,7 +283,9 @@ impl BlockDevice for ChaosDisk {
             if self.ledger[block_id] {
                 let (start, end) = self.calculate_offset(block_id as u64);
 
-                if let Some(policy) = self.should_trigger_fault(self.flush_count, block_id as u64) {
+                if let Some(policy) =
+                    self.should_trigger_fault(OpContext::Flush, self.flush_count, block_id as u64)
+                {
                     match policy {
                         FaultPolicy::None => self.commit_block_to_stable(block_id, start, end),
                         FaultPolicy::LostWrite => {

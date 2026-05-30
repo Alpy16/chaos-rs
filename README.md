@@ -65,7 +65,7 @@ fn test_deterministic_torn_write() {
 
             // 2. Schedule a power cut precisely halfway through the first flush iteration
             disk.set_fault(FaultTrigger {
-                condition: TriggerCondition::OnOperationCount(1),
+                condition: TriggerCondition::OnFlushCount(1),
                 policy: FaultPolicy::TornWrite { bytes_written: 2048 },
             });
 

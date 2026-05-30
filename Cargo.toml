@@ -1,5 +1,5 @@
 [package]
-name = "chaos_disk"
+name = "chaos-rs"
 version = "0.1.0"
 edition = "2024"
 

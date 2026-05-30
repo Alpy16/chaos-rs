@@ -1,6 +1,6 @@
-use chaos_disk::{
-    AlignedBlock, BlockDevice, BlockDeviceError, FaultPolicy, FaultTrigger, TriggerCondition,
-    run_crash_test,
+use chaos_rs::{
+    AdminControls, AlignedBlock, BlockDevice, BlockDeviceError, ChaosDisk, FaultPolicy,
+    FaultTrigger, TriggerCondition, run_crash_test,
 };
 
 #[test]
@@ -68,7 +68,7 @@ fn test_deterministic_torn_write() {
             disk.write_block(2, &payload)?;
 
             disk.set_fault(FaultTrigger {
-                condition: TriggerCondition::OnOperationCount(1),
+                condition: TriggerCondition::OnFlushCount(1),
                 policy: FaultPolicy::TornWrite {
                     bytes_written: 2048,
                 },
@@ -94,4 +94,119 @@ fn test_deterministic_torn_write() {
         Err(BlockDeviceError::InterruptedOperation)
     ));
     assert!(crash_result.is_ok());
+}
+
+#[test]
+fn test_buffer_size_error() {
+    // Scenario: Application provides a buffer that doesn't match the 4KB sector size
+    let mut disk = ChaosDisk::new(1);
+    let small_buffer = [0u8; 1024];
+    let large_buffer = [0u8; 8192];
+
+    assert_eq!(
+        disk.write_block(0, &small_buffer),
+        Err(BlockDeviceError::BufferSizeError)
+    );
+    assert_eq!(
+        disk.read_block(0, &mut [0u8; 5000]),
+        Err(BlockDeviceError::BufferSizeError)
+    );
+}
+
+#[test]
+fn test_alignment_mismatch() {
+    // Scenario: Buffer is 4096 bytes but start address is not page-aligned
+    let mut disk = ChaosDisk::new(1);
+
+    // Create a large buffer and find an offset that is definitely not a multiple of 4096
+    let data = vec![0u8; 10000];
+    let base_ptr = data.as_ptr() as usize;
+    let aligned_ptr = (base_ptr + 4095) & !4095;
+    let unaligned_offset = (aligned_ptr - base_ptr) + 1;
+
+    let unaligned_slice = &data[unaligned_offset..unaligned_offset + 4096];
+
+    assert_eq!(
+        disk.write_block(0, unaligned_slice),
+        Err(BlockDeviceError::AlignmentMismatch)
+    );
+}
+
+#[test]
+fn test_frozen_device_rejection() {
+    // Scenario: Device is unpowered/frozen and must reject all standard I/O
+    let mut disk = ChaosDisk::new(1);
+    let mut block = AlignedBlock::new();
+
+    // Trigger a crash to freeze the controller
+    disk.crash().unwrap();
+
+    assert_eq!(
+        disk.read_block(0, &mut block),
+        Err(BlockDeviceError::FrozenDevice)
+    );
+    assert_eq!(
+        disk.write_block(0, &block),
+        Err(BlockDeviceError::FrozenDevice)
+    );
+    assert_eq!(disk.flush(), Err(BlockDeviceError::FrozenDevice));
+}
+
+#[test]
+fn test_lost_write_semantics() {
+    // Scenario: Controller reports success but data never hits the media
+    let mut payload = AlignedBlock::new();
+    payload.data.fill(0xAA);
+
+    let (workload_result, _) = run_crash_test(
+        1,
+        |disk| {
+            disk.set_fault(FaultTrigger {
+                condition: TriggerCondition::OnWriteCount(1),
+                policy: FaultPolicy::LostWrite,
+            });
+
+            // This should return Ok(()) but the write is dropped
+            disk.write_block(0, &payload)?;
+            disk.flush()?;
+            Ok(())
+        },
+        |disk| {
+            let mut read_buffer = AlignedBlock::new();
+            disk.read_block(0, &mut read_buffer).unwrap();
+            // Should be empty/zeros because the write was lost
+            assert_eq!(read_buffer.data, [0u8; 4096]);
+        },
+    );
+
+    assert!(workload_result.is_ok());
+}
+
+#[test]
+fn test_bit_flip_precision() {
+    // Scenario: Silent data corruption (bit-rot) affects exactly one bit
+    let mut payload = AlignedBlock::new();
+    payload.data.fill(0x00);
+
+    run_crash_test(
+        1,
+        |disk| {
+            disk.set_fault(FaultTrigger {
+                condition: TriggerCondition::OnWriteCount(1),
+                policy: FaultPolicy::BitFlip {
+                    byte_offset: 100,
+                    bit_mask: 0b0000_0001,
+                },
+            });
+            disk.write_block(0, &payload)?;
+            disk.flush()?;
+            Ok(())
+        },
+        |disk| {
+            let mut read_buffer = AlignedBlock::new();
+            disk.read_block(0, &mut read_buffer).unwrap();
+            assert_eq!(read_buffer.data[100], 0b0000_0001);
+            assert_eq!(read_buffer.data[101], 0x00);
+        },
+    );
 }

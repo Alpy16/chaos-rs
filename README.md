@@ -1,8 +1,8 @@
-# chaos_disk
+# chaos-rs
 
 A deterministic, hardware-level chaos engineering framework and storage device simulator built in Rust.
 
-`chaos_disk` provides a page-aligned virtual disk sandbox designed to intercept low-level I/O operations and inject structural media failures—such as torn writes, lost writes, bit-rot, and sector corruption—at precise operational boundaries. It allows infrastructure engineers to build automated, reliable crash-consistency tests for databases, filesystems, and write-ahead logs without flaky or non-reproducible test runs.
+`chaos-rs` provides a page-aligned virtual disk sandbox designed to intercept low-level I/O operations and inject structural media failures—such as torn writes, lost writes, bit-rot, and sector corruption—at precise operational boundaries. It allows infrastructure engineers to build automated, reliable crash-consistency tests for databases, filesystems, and write-ahead logs without flaky or non-reproducible test runs.
 
 ---
 
@@ -50,7 +50,7 @@ pub trait AdminControls {
 The following integration snippet sets up a deterministic power loss mid-operation during a storage sync routine:
 
 ```rust
-use chaos_disk::{AlignedBlock, BlockDevice, BlockDeviceError, FaultPolicy, FaultTrigger, TriggerCondition, run_crash_test};
+use chaos_rs::{AlignedBlock, BlockDevice, BlockDeviceError, FaultPolicy, FaultTrigger, TriggerCondition, run_crash_test};
 
 #[test]
 fn test_deterministic_torn_write() {

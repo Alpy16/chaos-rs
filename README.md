@@ -1,32 +1,43 @@
 # chaos-rs
 
-A deterministic, hardware-level chaos engineering framework and storage device simulator built in Rust.
+A deterministic, page-aligned virtual disk simulator and circular Write-Ahead Log (WAL) framework built in Rust for crash-consistency and fault-injection testing.
 
-`chaos-rs` provides a page-aligned virtual disk sandbox designed to intercept low-level I/O operations and inject structural media failures—such as torn writes, lost writes, bit-rot, and sector corruption—at precise operational boundaries. It allows infrastructure engineers to build automated, reliable crash-consistency tests for databases, filesystems, and write-ahead logs without flaky or non-reproducible test runs.
+`chaos-rs` provides a user-space environment to simulate low-level block storage devices and WAL engines. It allows infrastructure engineers to inject media faults (torn writes, lost writes, bit-rot, and sector corruption) at precise, deterministic operational boundaries.
 
 ---
 
-## Architecture
+## Core Components
 
-The simulator maintains a dual-layer memory architecture in user space to mirror bare-metal storage controllers:
-
-* **Volatile Cache (`volatile_cache`):** Simulates onboarding drive RAM/write buffers. Ephemeral data stays here and is lost instantly during an ungraceful shutdown.
-* **Stable Storage (`stable_storage`):** Simulates persistent, non-volatile media cells (NAND Flash or Magnetic Platter). Data here survives power severance.
-* **Dirty Page Ledger (`ledger`):** A tracking bitset identifying modified cache blocks that have not yet been synchronized via a barrier call.
+The codebase consists of three modules:
+1. **`device`**: Defines standard hardware interface traits (`BlockDevice`, `AdminControls`) and error states (`BlockDeviceError`).
+2. **`disk`**: Implements `ChaosDisk`, a dual-layer virtual storage drive simulating volatile write cache and stable media platter storage, with page-aligned (`AlignedBlock`) operations.
+3. **`wal`**: Implements `WalManager`, a circular Write-Ahead Log engine with integrity checksum validation, crash recovery replay, and log checkpoints.
 
 ---
 
 ## Features
 
-* **Strict Page Alignment:** Enforces 4096-byte boundary verification on raw buffers to accurately mimic Direct I/O (`O_DIRECT`) and DMA constraints.
-* **Deterministic Scheduling:** Faults trip exactly on targeted write counts, flush counts, or specific block indices, eliminating random flakiness in CI/CD pipelines.
-* **Administrative Lifecycle Control:** Exposes manual hooks to `.crash()`, `.reboot()`, and `.resize()` the underlying partition media outside of the production application runtime.
-* **Automated Orchestration Harness:** Provides a generic `run_crash_test` framework that wraps workload execution, hardware power-severance, reboot recovery, and post-mortem state verification into a single atomic test cycle.
+### Storage Simulation & Fault Injection
+- **Volatile & Stable Storage:** Simulates drive controller RAM cache and persistent stable media separately. Ephemeral cache data is lost on simulated crashes.
+- **Strict Page Alignment:** Enforces 4096-byte DMA boundary checks on raw buffers.
+- **Deterministic Chaos Injection:** Schedule faults to trigger on exact write counts, flush counts, or block IDs.
+- **Fault Policies:**
+  - `TornWrite`: Simulates midway power failure by committing only a prefix of a block.
+  - `LostWrite`: Simulates silent controller drops (success returned, but data not written).
+  - `BitFlip`: Simulates magnetic/electrical bit-rot at specific offsets.
+  - `CorruptBlock`: Fills blocks with garbage values.
+
+### Circular Write-Ahead Log (WAL)
+- **Compact Log Header:** Pre-allocates a 32-byte header containing magic bytes (`A016`), checksum, monotonic sequence ID, and target block ID.
+- **Additive Checksum:** Integrates checksum calculation over WAL frames to validate integrity during recovery.
+- **Log Recovery:** Scans log partitions, verifies checksums to identify crash points, sorts entries by sequence ID, and chronologically replays updates to main storage.
+- **Log Checkpointing:** Replays pending updates from the WAL partition to their home database slots and wipes log headers to reclaim circular space.
 
 ---
 
-## Core Abstractions
+## Core Interfaces
 
+### Block Device API
 ```rust
 pub trait BlockDevice {
     fn read_block(&mut self, block_id: u64, buffer: &mut [u8]) -> Result<(), BlockDeviceError>;
@@ -40,15 +51,31 @@ pub trait AdminControls {
     fn is_frozen(&self) -> Result<bool, BlockDeviceError>;
     fn resize(&mut self, new_size: u64) -> Result<(), BlockDeviceError>;
 }
+```
 
+### WAL Manager API
+```rust
+pub struct WalManager {
+    pub device: ChaosDisk,
+    pub next_sequence_id: u64,
+    pub log_start_block: u64,
+    pub current_log_block: u64,
+    pub max_log_blocks: u64,
+}
+
+impl WalManager {
+    pub fn new(device: ChaosDisk, log_start_block: u64, max_log_blocks: u64) -> Self;
+    pub fn append_log_entry(&mut self, target_block_id: u64, payload: &[u8]) -> Result<(), BlockDeviceError>;
+    pub fn recover(&mut self) -> Result<(), BlockDeviceError>;
+    pub fn checkpoint(&mut self) -> Result<(), BlockDeviceError>;
+}
 ```
 
 ---
 
-## Usage Example
+## Usage Examples
 
-The following integration snippet sets up a deterministic power loss mid-operation during a storage sync routine:
-
+### Deterministic Torn Write Verification
 ```rust
 use chaos_rs::{AlignedBlock, BlockDevice, BlockDeviceError, FaultPolicy, FaultTrigger, TriggerCondition, run_crash_test};
 
@@ -60,47 +87,30 @@ fn test_deterministic_torn_write() {
     let (workload_result, crash_result) = run_crash_test(
         10,
         |disk| {
-            // 1. Stage full payload cleanly into volatile controller memory
             disk.write_block(2, &payload)?;
-
-            // 2. Schedule a power cut precisely halfway through the first flush iteration
             disk.set_fault(FaultTrigger {
                 condition: TriggerCondition::OnFlushCount(1),
                 policy: FaultPolicy::TornWrite { bytes_written: 2048 },
             });
-
-            // 3. This barrier call will truncate data transfer and return InterruptedOperation
             disk.flush()?;
             Ok(())
         },
         |disk| {
-            // 4. Post-Reboot Verification Phase
             let mut read_buffer = AlignedBlock::new();
             disk.read_block(2, &mut read_buffer).unwrap();
-
-            // First 2KB successfully hit persistent platter cells before power cut
             assert_eq!(read_buffer.data[0], 0xFF);
             assert_eq!(read_buffer.data[2047], 0xFF);
-
-            // Remaining 2KB never committed and stayed zeroed
             assert_eq!(read_buffer.data[2048], 0);
-            assert_eq!(read_buffer.data[4095], 0);
         },
     );
-
-    assert!(matches!(workload_result, Err(BlockDeviceError::InterruptedOperation)));
-    assert!(crash_result.is_ok());
 }
-
 ```
 
 ---
 
 ## Testing
 
-Run the integration and verification test suite using cargo:
-
+Run the verification suite:
 ```bash
 cargo test
-
 ```

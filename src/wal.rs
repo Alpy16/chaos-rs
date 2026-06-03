@@ -1,10 +1,45 @@
 use crate::device::{BlockDevice, BlockDeviceError};
 use crate::disk::{AlignedBlock, ChaosDisk};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryReport {
+    pub last_sequence: u64,
+    pub corruption_detected: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalError {
+    CorruptFrame,
+    InvalidMagic,
+    ChecksumMismatch,
+    InvalidPayloadSize,
+    Device(BlockDeviceError),
+}
+
+impl std::fmt::Display for WalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WalError::CorruptFrame => write!(f, "WAL Error: Corrupt frame"),
+            WalError::InvalidMagic => write!(f, "WAL Error: Invalid magic signature"),
+            WalError::ChecksumMismatch => write!(f, "WAL Error: Checksum mismatch"),
+            WalError::InvalidPayloadSize => write!(f, "WAL Error: Invalid payload size"),
+            WalError::Device(e) => write!(f, "WAL Error: Device failure: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for WalError {}
+
+impl From<BlockDeviceError> for WalError {
+    fn from(err: BlockDeviceError) -> Self {
+        WalError::Device(err)
+    }
+}
+
 #[repr(C)]
 pub struct LogHeader {
     pub magic: [u8; 4],       // "A016"
-    pub checksum: u32,        // CRC32 or similar of header + payload
+    pub checksum: u32,        // CRC32 checksum of the entire block
     pub sequence_id: u64,     // Monotonic ID for log ordering
     pub target_block_id: u64, // The physical location this log entry updates
     pub payload_size: u32,    // Length of the data following this header
@@ -16,8 +51,8 @@ pub struct WalManager {
     pub next_sequence_id: u64,
     /// The first block ID allocated for the WAL area
     pub log_start_block: u64,
-    /// The current block we are writing to
-    pub current_log_block: u64,
+    /// The current index within the WAL ring we are writing to
+    pub current_log_index: u64,
     /// Total number of blocks allocated for the circular log
     pub max_log_blocks: u64,
 }
@@ -28,7 +63,7 @@ impl WalManager {
             device,
             next_sequence_id: 1,
             log_start_block,
-            current_log_block: 0,
+            current_log_index: 0,
             max_log_blocks,
         }
     }
@@ -38,12 +73,10 @@ impl WalManager {
         sequence_id: u64,
         target_block_id: u64,
         payload: &[u8],
-    ) -> AlignedBlock {
-        assert!(
-            payload.len() <= 4096 - 32,
-            "Payload size {} exceeds maximum available space in a 4KB block",
-            payload.len()
-        );
+    ) -> Result<AlignedBlock, WalError> {
+        if payload.len() > 4096 - 32 {
+            return Err(WalError::InvalidPayloadSize);
+        }
         let mut frame = AlignedBlock::new();
         let header = LogHeader {
             magic: *b"A016",
@@ -53,6 +86,7 @@ impl WalManager {
             payload_size: payload.len() as u32,
             _reserved: 0,
         };
+
         // Copy header fields into the frame
         frame.data[0..4].copy_from_slice(&header.magic);
         frame.data[4..8].copy_from_slice(&header.checksum.to_be_bytes());
@@ -69,79 +103,79 @@ impl WalManager {
         let checksum = self.compute_block_checksum(&frame.data);
         frame.data[4..8].copy_from_slice(&checksum.to_be_bytes());
 
-        frame
+        Ok(frame)
     }
 
-    /// Computes a simple additive checksum over the 4KB block to validate integrity.
+    /// Computes standard CRC-32 checksum over the 4KB block to validate integrity.
     fn compute_block_checksum(&self, data: &[u8; 4096]) -> u32 {
-        data.chunks_exact(4)
-            .map(|chunk| u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .fold(0u32, |acc, val| acc.wrapping_add(val))
+        let mut crc = 0xFFFFFFFFu32;
+        for &byte in data {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                if crc & 1 != 0 {
+                    crc = (crc >> 1) ^ 0xEDB88320;
+                } else {
+                    crc >>= 1;
+                }
+            }
+        }
+        !crc
     }
 
     pub fn append_log_entry(
         &mut self,
         target_block_id: u64,
         payload: &[u8],
-    ) -> Result<(), BlockDeviceError> {
-        let physical_block_id = self.log_start_block + self.current_log_block;
-        let frame = self.serialize_frame(self.next_sequence_id, target_block_id, payload);
+    ) -> Result<(), WalError> {
+        let physical_block_id = self.log_start_block + self.current_log_index;
+        let frame = self.serialize_frame(self.next_sequence_id, target_block_id, payload)?;
 
         self.device.write_block(physical_block_id, &frame.data)?;
         // Critical: Flush the log to stable storage so it survives a crash
         self.device.flush()?;
 
         self.next_sequence_id += 1;
-        self.current_log_block = (self.current_log_block + 1) % self.max_log_blocks;
+        self.current_log_index = (self.current_log_index + 1) % self.max_log_blocks;
 
         Ok(())
     }
 
     /// Scans the WAL partition, validates integrity, and replays entries in chronological order.
-    pub fn recover(&mut self) -> Result<(), BlockDeviceError> {
+    pub fn recover(&mut self) -> Result<RecoveryReport, WalError> {
         let mut valid_entries = Vec::new();
         let mut scratch_pad = AlignedBlock::new();
-
-        println!("Executing low-level system recovery protocol...");
+        let mut corruption_detected = false;
 
         // 1. Linear scan across the designated log partition zone
         for relative_idx in 0..self.max_log_blocks {
             let physical_block_id = self.log_start_block + relative_idx;
 
             // Read raw block into RAM workspace
-            if let Err(e) = self
-                .device
-                .read_block(physical_block_id, &mut scratch_pad.data)
-            {
-                println!(
-                    "Hardware read failure at block {}: {}. Stopping scan.",
-                    physical_block_id, e
-                );
-                break;
-            }
+            self.device.read_block(physical_block_id, &mut scratch_pad.data)?;
 
             // Extract Magic Signature
             if &scratch_pad.data[0..4] != b"A016" {
-                continue; // Skip uninitialized or non-log space
+                let is_empty = scratch_pad.data.iter().all(|&b| b == 0);
+                if is_empty {
+                    continue; // Skip uninitialized space
+                } else {
+                    corruption_detected = true;
+                    break; // Recovery boundary reached
+                }
             }
 
             // Extract Stored Checksum
             let stored_checksum = u32::from_be_bytes(scratch_pad.data[4..8].try_into().unwrap());
 
-            // Reset checksum field to zero inline for verification (matching serialization logic)
-            scratch_pad.data[4..8].copy_from_slice(&[0u8; 4]);
+            // Create an isolated sandbox copy of the block data for CRC calculation
+            let mut validation_buffer = scratch_pad.data;
+            validation_buffer[4..8].copy_from_slice(&[0u8; 4]);
 
-            // Execute Integrity Check
-            let computed_checksum = self.compute_block_checksum(&scratch_pad.data);
+            // Execute Integrity Check using our isolated sandbox buffer
+            let computed_checksum = self.compute_block_checksum(&validation_buffer);
             if stored_checksum != computed_checksum {
-                println!(
-                    "Checksum Mismatch at physical sector {}! Discarding torn frame.",
-                    physical_block_id
-                );
-                // In an append-only timeline, a checksum failure marks the crash point.
-                // We must break here because subsequent blocks contain stale data
-                // from a previous wrap-around of the circular log.
-                break;
+                corruption_detected = true;
+                break; // Recovery boundary reached
             }
 
             // Unpack metadata
@@ -149,6 +183,12 @@ impl WalManager {
             let target_block_id = u64::from_be_bytes(scratch_pad.data[16..24].try_into().unwrap());
             let payload_size =
                 u32::from_be_bytes(scratch_pad.data[24..28].try_into().unwrap()) as usize;
+
+            // Layered Defense: Terminate if payload size is corrupted and overflows the page bounds
+            if payload_size > 4096 - 32 {
+                corruption_detected = true;
+                break; // Recovery boundary reached
+            }
 
             // Store for sorting (Sequence ID, Target Block, Payload, Physical Index)
             let mut payload = vec![0u8; payload_size];
@@ -180,17 +220,16 @@ impl WalManager {
         // 5. Sync WalManager state
         if highest_valid_seq > 0 {
             self.next_sequence_id = highest_valid_seq + 1;
-            self.current_log_block = (last_physical_idx + 1) % self.max_log_blocks;
+            self.current_log_index = (last_physical_idx + 1) % self.max_log_blocks;
         }
 
-        println!(
-            "System recovery complete. Reality restored to sequence: {}",
-            highest_valid_seq
-        );
-        Ok(())
+        Ok(RecoveryReport {
+            last_sequence: highest_valid_seq,
+            corruption_detected,
+        })
     }
 
-    pub fn checkpoint(&mut self) -> Result<(), BlockDeviceError> {
+    pub fn checkpoint(&mut self) -> Result<(), WalError> {
         let mut valid_entries = Vec::new();
         let mut scratch_pad = AlignedBlock::new();
 
@@ -202,22 +241,35 @@ impl WalManager {
 
             // Extract Magic Signature
             if &scratch_pad.data[0..4] != b"A016" {
-                continue; // Skip empty space
+                let is_empty = scratch_pad.data.iter().all(|&b| b == 0);
+                if is_empty {
+                    continue; // Skip empty space
+                } else {
+                    return Err(WalError::InvalidMagic);
+                }
             }
 
-            // Extract and verify checksum (zeroing the slot inline for the hash check)
+            // Extract Stored Checksum
             let stored_checksum = u32::from_be_bytes(scratch_pad.data[4..8].try_into().unwrap());
-            scratch_pad.data[4..8].copy_from_slice(&[0u8; 4]);
+            
+            // Create an isolated sandbox copy of the block data for the checkpoint integrity pass.
+            // This mirrors the pristine forensic architecture inside our recover module.
+            let mut validation_buffer = scratch_pad.data;
+            validation_buffer[4..8].copy_from_slice(&[0u8; 4]);
 
-            if stored_checksum != self.compute_block_checksum(&scratch_pad.data) {
-                // A checksum failure in an append-only timeline marks the crash point.
-                break;
+            if stored_checksum != self.compute_block_checksum(&validation_buffer) {
+                return Err(WalError::ChecksumMismatch);
             }
 
             let seq_id = u64::from_be_bytes(scratch_pad.data[8..16].try_into().unwrap());
             let target_id = u64::from_be_bytes(scratch_pad.data[16..24].try_into().unwrap());
             let payload_size =
                 u32::from_be_bytes(scratch_pad.data[24..28].try_into().unwrap()) as usize;
+
+            // Layered Defense: Terminate if payload size is corrupted and overflows the page bounds
+            if payload_size > 4096 - 32 {
+                return Err(WalError::InvalidPayloadSize);
+            }
 
             let mut payload = vec![0u8; payload_size];
             payload.copy_from_slice(&scratch_pad.data[32..32 + payload_size]);
@@ -244,7 +296,7 @@ impl WalManager {
         self.device.flush()?;
 
         // 5. Reset the write head to the beginning of the partition
-        self.current_log_block = 0;
+        self.current_log_index = 0;
         Ok(())
     }
 }

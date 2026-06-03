@@ -59,15 +59,15 @@ pub struct WalManager {
     pub device: ChaosDisk,
     pub next_sequence_id: u64,
     pub log_start_block: u64,
-    pub current_log_block: u64,
+    pub current_log_index: u64,
     pub max_log_blocks: u64,
 }
 
 impl WalManager {
     pub fn new(device: ChaosDisk, log_start_block: u64, max_log_blocks: u64) -> Self;
-    pub fn append_log_entry(&mut self, target_block_id: u64, payload: &[u8]) -> Result<(), BlockDeviceError>;
-    pub fn recover(&mut self) -> Result<(), BlockDeviceError>;
-    pub fn checkpoint(&mut self) -> Result<(), BlockDeviceError>;
+    pub fn append_log_entry(&mut self, target_block_id: u64, payload: &[u8]) -> Result<(), WalError>;
+    pub fn recover(&mut self) -> Result<RecoveryReport, WalError>;
+    pub fn checkpoint(&mut self) -> Result<(), WalError>;
 }
 ```
 

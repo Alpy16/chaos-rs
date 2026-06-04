@@ -1,116 +1,325 @@
 # chaos-rs
 
-A deterministic, page-aligned virtual disk simulator and circular Write-Ahead Log (WAL) framework built in Rust for crash-consistency and fault-injection testing.
+![CI](https://github.com/Alpy16/chaos-rs/actions/workflows/rust.yml/badge.svg)
 
-`chaos-rs` provides a user-space environment to simulate low-level block storage devices and WAL engines. It allows infrastructure engineers to inject media faults (torn writes, lost writes, bit-rot, and sector corruption) at precise, deterministic operational boundaries.
+A zero-dependency, deterministic, page-aligned virtual block-device simulator and circular Write-Ahead Log (WAL) framework built in Rust for crash-consistency and fault-injection testing.
+
+`chaos-rs` provides a user-space environment for testing storage engines, WAL implementations, and persistence layers under realistic hardware failure conditions. It simulates volatile write caches, durable media, explicit flush boundaries, and deterministic storage faults such as torn writes, lost writes, bit flips, and sector corruption.
 
 ---
 
-## Core Components
+## About
 
-The codebase consists of three modules:
-1. **`device`**: Defines standard hardware interface traits (`BlockDevice`, `AdminControls`) and error states (`BlockDeviceError`).
-2. **`disk`**: Implements `ChaosDisk`, a dual-layer virtual storage drive simulating volatile write cache and stable media platter storage, with page-aligned (`AlignedBlock`) operations.
-3. **`wal`**: Implements `WalManager`, a circular Write-Ahead Log engine with integrity checksum validation, crash recovery replay, and log checkpoints.
+Modern storage software is often tested against idealized I/O behavior. Real hardware is not ideal.
+
+`chaos-rs` exists to provide a lightweight environment where infrastructure engineers can deterministically reproduce storage failures and verify recovery logic without relying on operating-system-level fault injection, external databases, or heavyweight testing frameworks.
+
+The project is intentionally focused on a narrow goal:
+
+> Simulate hardware failure and validate crash-recovery correctness.
+
+It is **not** a production database, a virtual filesystem, or a benchmarking framework.
 
 ---
 
 ## Features
 
-### Storage Simulation & Fault Injection
-- **Volatile & Stable Storage:** Simulates drive controller RAM cache and persistent stable media separately. Ephemeral cache data is lost on simulated crashes.
-- **Strict Page Alignment:** Enforces 4096-byte DMA boundary checks on raw buffers.
-- **Deterministic Chaos Injection:** Schedule faults to trigger on exact write counts, flush counts, or block IDs.
-- **Fault Policies:**
-  - `TornWrite`: Simulates midway power failure by committing only a prefix of a block.
-  - `LostWrite`: Simulates silent controller drops (success returned, but data not written).
-  - `BitFlip`: Simulates magnetic/electrical bit-rot at specific offsets.
-  - `CorruptBlock`: Fills blocks with garbage values.
+### Block Device Simulation
 
-### Circular Write-Ahead Log (WAL)
-- **Compact Log Header:** Pre-allocates a 32-byte header containing magic bytes (`A016`), checksum, monotonic sequence ID, and target block ID.
-- **Additive Checksum:** Integrates checksum calculation over WAL frames to validate integrity during recovery.
-- **Log Recovery:** Scans log partitions, verifies checksums to identify crash points, sorts entries by sequence ID, and chronologically replays updates to main storage.
-- **Log Checkpointing:** Replays pending updates from the WAL partition to their home database slots and wipes log headers to reclaim circular space.
+- Dual-layer storage model:
+  - Volatile controller cache
+  - Stable persistent media
+- Explicit durability boundaries via `flush()`
+- Simulated crash and reboot operations
+- Strict 4096-byte page-aligned I/O
+- Configurable device resizing
+- Frozen-device failure states
+
+### Deterministic Fault Injection
+
+Supported fault policies:
+
+| Fault | Description |
+|---------|-------------|
+| `TornWrite` | Commits only a prefix of a block and interrupts the operation |
+| `LostWrite` | Silently drops a write while reporting success |
+| `BitFlip` | Flips specific bits at a target byte offset |
+| `CorruptBlock` | Overwrites a block with deterministic garbage data |
+
+Supported trigger conditions:
+
+- Write count
+- Flush count
+- Block ID
+- Flush count + block ID
+
+### Circular Write-Ahead Log
+
+- Fixed-size circular log region
+- 32-byte WAL frame header
+- CRC-32 integrity validation
+- Monotonic sequence IDs
+- Crash-boundary detection
+- Chronological replay
+- Log checkpointing
+- Recovery reporting
+
+### Zero Dependencies
+
+`chaos-rs` is built entirely on the Rust standard library.
+
+No external crates are required.
 
 ---
 
-## Core Interfaces
+## Architecture
 
-### Block Device API
+```text
+src/
+├── device.rs
+├── disk.rs
+├── wal.rs
+└── lib.rs
+```
+
+### device.rs
+
+Defines hardware-facing abstractions:
+
+```rust
+pub trait BlockDevice
+pub trait AdminControls
+pub enum BlockDeviceError
+```
+
+### disk.rs
+
+Implements:
+
+```rust
+ChaosDisk
+AlignedBlock
+FaultPolicy
+FaultTrigger
+TriggerCondition
+```
+
+Responsibilities:
+
+- Stable media simulation
+- Volatile cache simulation
+- Alignment enforcement
+- Fault scheduling
+- Crash/reboot behavior
+
+### wal.rs
+
+Implements:
+
+```rust
+WalManager
+LogHeader
+RecoveryReport
+WalError
+```
+
+Responsibilities:
+
+- WAL frame creation
+- CRC validation
+- Recovery replay
+- Checkpointing
+- Circular log management
+
+---
+
+## Quickstart
+
+### Requirements
+
+- Rust stable
+- Cargo
+
+### Installation
+
+Local dependency:
+
+```toml
+[dependencies]
+chaos_rs = { path = "../chaos-rs" }
+```
+
+GitHub dependency:
+
+```toml
+[dependencies]
+chaos_rs = { git = "https://github.com/Alpy16/chaos-rs" }
+```
+
+---
+
+## Core APIs
+
+### Block Device
+
 ```rust
 pub trait BlockDevice {
-    fn read_block(&mut self, block_id: u64, buffer: &mut [u8]) -> Result<(), BlockDeviceError>;
-    fn write_block(&mut self, block_id: u64, data: &[u8]) -> Result<(), BlockDeviceError>;
+    fn read_block(
+        &mut self,
+        block_id: u64,
+        buffer: &mut [u8],
+    ) -> Result<(), BlockDeviceError>;
+
+    fn write_block(
+        &mut self,
+        block_id: u64,
+        data: &[u8],
+    ) -> Result<(), BlockDeviceError>;
+
     fn flush(&mut self) -> Result<(), BlockDeviceError>;
 }
+```
 
+### Administrative Controls
+
+```rust
 pub trait AdminControls {
     fn crash(&mut self) -> Result<(), BlockDeviceError>;
+
     fn reboot(&mut self) -> Result<(), BlockDeviceError>;
+
     fn is_frozen(&self) -> Result<bool, BlockDeviceError>;
-    fn resize(&mut self, new_size: u64) -> Result<(), BlockDeviceError>;
+
+    fn resize(&mut self, new_size: u64)
+        -> Result<(), BlockDeviceError>;
 }
 ```
 
-### WAL Manager API
+### WAL Recovery
+
 ```rust
-pub struct WalManager {
-    pub device: ChaosDisk,
-    pub next_sequence_id: u64,
-    pub log_start_block: u64,
-    pub current_log_index: u64,
-    pub max_log_blocks: u64,
-}
-
-impl WalManager {
-    pub fn new(device: ChaosDisk, log_start_block: u64, max_log_blocks: u64) -> Self;
-    pub fn append_log_entry(&mut self, target_block_id: u64, payload: &[u8]) -> Result<(), WalError>;
-    pub fn recover(&mut self) -> Result<RecoveryReport, WalError>;
-    pub fn checkpoint(&mut self) -> Result<(), WalError>;
+pub struct RecoveryReport {
+    pub last_sequence: u64,
+    pub corruption_detected: bool,
 }
 ```
+
+```rust
+pub fn recover(
+    &mut self,
+) -> Result<RecoveryReport, WalError>;
+```
+
+Recovery:
+
+1. Scans the WAL region
+2. Validates CRC-32 checksums
+3. Detects corruption boundaries
+4. Replays valid entries in sequence order
+5. Synchronizes WAL state
+6. Returns a recovery report
 
 ---
 
-## Usage Examples
+## Example
 
-### Deterministic Torn Write Verification
+### Deterministic Torn Write
+
 ```rust
-use chaos_rs::{AlignedBlock, BlockDevice, BlockDeviceError, FaultPolicy, FaultTrigger, TriggerCondition, run_crash_test};
+use chaos_rs::{
+    AlignedBlock,
+    BlockDevice,
+    FaultPolicy,
+    FaultTrigger,
+    TriggerCondition,
+    run_crash_test,
+};
 
-#[test]
-fn test_deterministic_torn_write() {
-    let mut payload = AlignedBlock::new();
-    payload.data.fill(0xFF);
+let mut payload = AlignedBlock::new();
+payload.data.fill(0xFF);
 
-    let (workload_result, crash_result) = run_crash_test(
-        10,
-        |disk| {
-            disk.write_block(2, &payload)?;
-            disk.set_fault(FaultTrigger {
-                condition: TriggerCondition::OnFlushCount(1),
-                policy: FaultPolicy::TornWrite { bytes_written: 2048 },
-            });
-            disk.flush()?;
-            Ok(())
-        },
-        |disk| {
-            let mut read_buffer = AlignedBlock::new();
-            disk.read_block(2, &mut read_buffer).unwrap();
-            assert_eq!(read_buffer.data[0], 0xFF);
-            assert_eq!(read_buffer.data[2047], 0xFF);
-            assert_eq!(read_buffer.data[2048], 0);
-        },
-    );
-}
+let (_workload, _recovery) = run_crash_test(
+    10,
+    |disk| {
+        disk.write_block(2, &payload.data)?;
+
+        disk.set_fault(FaultTrigger {
+            condition: TriggerCondition::OnFlushCount(1),
+            policy: FaultPolicy::TornWrite {
+                bytes_written: 2048,
+            },
+        });
+
+        disk.flush()?;
+        Ok(())
+    },
+    |disk| {
+        let mut read_buffer = AlignedBlock::new();
+
+        disk.read_block(2, &mut read_buffer.data)
+            .unwrap();
+
+        assert_eq!(read_buffer.data[0], 0xFF);
+        assert_eq!(read_buffer.data[2047], 0xFF);
+        assert_eq!(read_buffer.data[2048], 0);
+    },
+);
 ```
 
 ---
 
 ## Testing
 
-Run the verification suite:
+Run all tests:
+
 ```bash
 cargo test
 ```
+
+Run formatting checks:
+
+```bash
+cargo fmt --check
+```
+
+Run linting:
+
+```bash
+cargo clippy -- -D warnings
+```
+
+Current coverage includes:
+
+- Block device correctness
+- Flush durability
+- Crash/reboot semantics
+- Alignment validation
+- Device resizing
+- Lost writes
+- Torn writes
+- Torn flushes
+- Bit flips
+- Corrupt blocks
+- Deterministic trigger scheduling
+- WAL frame validation
+- WAL recovery
+- Corruption boundaries
+- Circular log wraparound
+- WAL checkpointing
+
+---
+
+## Future Work
+
+- Property-based crash testing
+- Trace recording and replay
+- Latency simulation
+- Async I/O fault scheduling
+- Python bindings
+- Storage-engine integration examples
+
+---
+
+## License
+
+MIT

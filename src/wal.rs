@@ -106,6 +106,32 @@ impl WalManager {
         Ok(frame)
     }
 
+    /// Internal helper to validate and unpack a log frame.
+    fn decode_frame(&self, data: &[u8; 4096]) -> Result<(u64, u64, Vec<u8>), WalError> {
+        if &data[0..4] != b"A016" {
+            return Err(WalError::InvalidMagic);
+        }
+
+        let stored_checksum = u32::from_be_bytes(data[4..8].try_into().unwrap());
+        let mut validation_buffer = *data;
+        validation_buffer[4..8].copy_from_slice(&[0u8; 4]);
+
+        if stored_checksum != self.compute_block_checksum(&validation_buffer) {
+            return Err(WalError::ChecksumMismatch);
+        }
+
+        let seq_id = u64::from_be_bytes(data[8..16].try_into().unwrap());
+        let target_id = u64::from_be_bytes(data[16..24].try_into().unwrap());
+        let payload_size = u32::from_be_bytes(data[24..28].try_into().unwrap()) as usize;
+
+        if payload_size > 4096 - 32 {
+            return Err(WalError::InvalidPayloadSize);
+        }
+
+        let mut payload = data[32..32 + payload_size].to_vec();
+        Ok((seq_id, target_id, payload))
+    }
+
     /// Computes standard CRC-32 checksum over the 4KB block to validate integrity.
     fn compute_block_checksum(&self, data: &[u8; 4096]) -> u32 {
         let mut crc = 0xFFFFFFFFu32;
@@ -151,50 +177,21 @@ impl WalManager {
             let physical_block_id = self.log_start_block + relative_idx;
 
             // Read raw block into RAM workspace
-            self.device.read_block(physical_block_id, &mut scratch_pad.data)?;
+            self.device
+                .read_block(physical_block_id, &mut scratch_pad.data)?;
 
-            // Extract Magic Signature
-            if &scratch_pad.data[0..4] != b"A016" {
-                let is_empty = scratch_pad.data.iter().all(|&b| b == 0);
-                if is_empty {
+            match self.decode_frame(&scratch_pad.data) {
+                Ok((seq_id, target_id, payload)) => {
+                    valid_entries.push((seq_id, target_id, payload, relative_idx));
+                }
+                Err(WalError::InvalidMagic) if scratch_pad.data.iter().all(|&b| b == 0) => {
                     continue; // Skip uninitialized space
-                } else {
+                }
+                Err(_) => {
                     corruption_detected = true;
-                    break; // Recovery boundary reached
+                    break; // Recovery boundary reached (Torn write or bit rot)
                 }
             }
-
-            // Extract Stored Checksum
-            let stored_checksum = u32::from_be_bytes(scratch_pad.data[4..8].try_into().unwrap());
-
-            // Create an isolated sandbox copy of the block data for CRC calculation
-            let mut validation_buffer = scratch_pad.data;
-            validation_buffer[4..8].copy_from_slice(&[0u8; 4]);
-
-            // Execute Integrity Check using our isolated sandbox buffer
-            let computed_checksum = self.compute_block_checksum(&validation_buffer);
-            if stored_checksum != computed_checksum {
-                corruption_detected = true;
-                break; // Recovery boundary reached
-            }
-
-            // Unpack metadata
-            let seq_id = u64::from_be_bytes(scratch_pad.data[8..16].try_into().unwrap());
-            let target_block_id = u64::from_be_bytes(scratch_pad.data[16..24].try_into().unwrap());
-            let payload_size =
-                u32::from_be_bytes(scratch_pad.data[24..28].try_into().unwrap()) as usize;
-
-            // Layered Defense: Terminate if payload size is corrupted and overflows the page bounds
-            if payload_size > 4096 - 32 {
-                corruption_detected = true;
-                break; // Recovery boundary reached
-            }
-
-            // Store for sorting (Sequence ID, Target Block, Payload, Physical Index)
-            let mut payload = vec![0u8; payload_size];
-            payload.copy_from_slice(&scratch_pad.data[32..32 + payload_size]);
-
-            valid_entries.push((seq_id, target_block_id, payload, relative_idx));
         }
 
         // 2. Sort entries by Sequence ID to handle circular wrap-around correctly
@@ -239,41 +236,15 @@ impl WalManager {
             self.device
                 .read_block(physical_block_id, &mut scratch_pad.data)?;
 
-            // Extract Magic Signature
-            if &scratch_pad.data[0..4] != b"A016" {
-                let is_empty = scratch_pad.data.iter().all(|&b| b == 0);
-                if is_empty {
-                    continue; // Skip empty space
-                } else {
-                    return Err(WalError::InvalidMagic);
+            match self.decode_frame(&scratch_pad.data) {
+                Ok((seq_id, target_id, payload)) => {
+                    valid_entries.push((seq_id, target_id, payload));
                 }
+                Err(WalError::InvalidMagic) if scratch_pad.data.iter().all(|&b| b == 0) => {
+                    continue;
+                }
+                Err(e) => return Err(e),
             }
-
-            // Extract Stored Checksum
-            let stored_checksum = u32::from_be_bytes(scratch_pad.data[4..8].try_into().unwrap());
-            
-            // Create an isolated sandbox copy of the block data for the checkpoint integrity pass.
-            // This mirrors the pristine forensic architecture inside our recover module.
-            let mut validation_buffer = scratch_pad.data;
-            validation_buffer[4..8].copy_from_slice(&[0u8; 4]);
-
-            if stored_checksum != self.compute_block_checksum(&validation_buffer) {
-                return Err(WalError::ChecksumMismatch);
-            }
-
-            let seq_id = u64::from_be_bytes(scratch_pad.data[8..16].try_into().unwrap());
-            let target_id = u64::from_be_bytes(scratch_pad.data[16..24].try_into().unwrap());
-            let payload_size =
-                u32::from_be_bytes(scratch_pad.data[24..28].try_into().unwrap()) as usize;
-
-            // Layered Defense: Terminate if payload size is corrupted and overflows the page bounds
-            if payload_size > 4096 - 32 {
-                return Err(WalError::InvalidPayloadSize);
-            }
-
-            let mut payload = vec![0u8; payload_size];
-            payload.copy_from_slice(&scratch_pad.data[32..32 + payload_size]);
-            valid_entries.push((seq_id, target_id, payload));
         }
 
         // 2. Sort entries chronologically to handle circular buffer wrap-around

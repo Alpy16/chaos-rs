@@ -207,7 +207,7 @@ fn resize_expands_disk_with_zeroed_new_blocks() {
     write_buffer.data[0..5].copy_from_slice(b"hello");
     disk.write_block(1, &write_buffer.data).unwrap();
     disk.flush().unwrap();
-    disk.resize(50);
+    disk.resize(50).unwrap();
 
     disk.read_block(1, &mut read_buffer.data).unwrap();
     assert_eq!(&read_buffer.data[0..5], b"hello");
@@ -224,7 +224,7 @@ fn resize_shrinks_disk_and_rejects_old_blocks() {
     write_buffer.data[0..5].copy_from_slice(b"hello");
     disk.write_block(1, &write_buffer.data).unwrap();
     disk.flush().unwrap();
-    disk.resize(4);
+    disk.resize(4).unwrap();
 
     disk.read_block(1, &mut read_buffer.data).unwrap();
     assert_eq!(&read_buffer.data[0..5], b"hello");

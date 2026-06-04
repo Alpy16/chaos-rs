@@ -4,7 +4,7 @@ pub mod wal;
 
 pub use device::{AdminControls, BlockDevice, BlockDeviceError};
 pub use disk::{AlignedBlock, ChaosDisk, FaultPolicy, FaultTrigger, TriggerCondition};
-pub use wal::{LogHeader, WalManager, WalError, RecoveryReport};
+pub use wal::{LogHeader, RecoveryReport, WalError, WalManager};
 
 /// A high-level orchestration harness for crash-consistency testing.
 ///

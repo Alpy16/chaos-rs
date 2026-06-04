@@ -128,7 +128,7 @@ impl WalManager {
             return Err(WalError::InvalidPayloadSize);
         }
 
-        let mut payload = data[32..32 + payload_size].to_vec();
+        let payload = data[32..32 + payload_size].to_vec();
         Ok((seq_id, target_id, payload))
     }
 

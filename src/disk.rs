@@ -30,6 +30,12 @@ impl DerefMut for AlignedBlock {
     }
 }
 
+impl Default for AlignedBlock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Defines when a scheduled fault should "trip" and execute its policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TriggerCondition {
@@ -154,7 +160,7 @@ impl ChaosDisk {
     /// Ensures the provided slice is aligned to 4KB in memory, simulating DMA constraints.
     pub fn check_alignment(&self, buffer: &[u8]) -> Result<(), BlockDeviceError> {
         let memory_address = buffer.as_ptr() as usize;
-        if memory_address % self.block_size != 0 {
+        if !memory_address.is_multiple_of(self.block_size) {
             return Err(BlockDeviceError::AlignmentMismatch);
         }
         Ok(())

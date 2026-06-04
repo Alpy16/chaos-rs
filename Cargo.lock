@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "chaos_rs"
+name = "chaos-rs"
 version = "0.1.0"

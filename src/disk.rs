@@ -30,8 +30,6 @@ impl DerefMut for AlignedBlock {
     }
 }
 
-
-
 /// Defines when a scheduled fault should "trip" and execute its policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TriggerCondition {
@@ -246,6 +244,7 @@ impl BlockDevice for ChaosDisk {
                 }
                 FaultPolicy::LostWrite => {
                     // Silently drop write: simulate success without dirtying ledger or modifying RAM
+                    // Note: Returns Ok(()) by falling through to the end of the function.
                 }
                 FaultPolicy::TornWrite { bytes_written } => {
                     let clamped_bytes = bytes_written.min(self.block_size);
@@ -301,8 +300,11 @@ impl BlockDevice for ChaosDisk {
                     match policy {
                         FaultPolicy::None => self.commit_block_to_stable(block_id, start, end),
                         FaultPolicy::LostWrite => {
-                            // Clear dirty flag so the data appears synchronized, but never touch platter cells
+                            // Clear dirty flag and revert cache to stable storage to simulate
+                            // the controller discarding the buffer without actually writing to media.
                             self.ledger[block_id] = false;
+                            self.volatile_cache[start..end]
+                                .copy_from_slice(&self.stable_storage[start..end]);
                         }
                         FaultPolicy::TornWrite { bytes_written } => {
                             let clamped_bytes = bytes_written.min(self.block_size);

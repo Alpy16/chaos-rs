@@ -1,6 +1,10 @@
 [package]
-name = "chaos_rs"
+name = "chaos-rs"
 version = "0.1.0"
 edition = "2024"
+
+[lib]
+name = "chaos_rs"
+path = "src/lib.rs"
 
 [dependencies]

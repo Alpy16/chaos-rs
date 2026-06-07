@@ -1,0 +1,7 @@
+[RUNNING] test_write_cache_power_loss
+    [FAULT_ARMED] Policy: TornWrite
+    [WORKLOAD_RESULT] Error: Hardware Alignment Violation
+
+    [RUNNING] test_stable_storage_durability
+    [FAULT_ARMED] Policy: None
+    [WORKLOAD_RESULT] Status: SUCCESS
